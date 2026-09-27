@@ -42,7 +42,21 @@ accepted); ``expected_id`` is the image the device should have installed,
 computed by the channel's resolution rules inside the same write
 transaction that stored the receipt and never rewritten afterwards —
 later policy or public-key changes do not alter it, and the
-installation-audit endpoint reads it back as saved.
+installation-audit endpoint reads it back as saved.  ``expected_role``
+freezes the *bucket role* that resolution produced at acceptance time:
+``candidate`` only when the device's bucket selected the candidate image
+and the candidate was trusted; ``stable`` for the stable bucket and for
+the untrusted-candidate and risk-breaker fallbacks.  The canary risk
+breaker's sample is counted by this frozen role, never by comparing image
+ids, so a channel whose stable and candidate images are the same id still
+classifies every receipt correctly.  Databases created before this column
+existed are upgraded in-place: rows whose role is reliably determinable
+(current-revision receipts on channels binding two *different* image ids)
+are backfilled, same-image or older-revision rows are left NULL — an
+ambiguous role is never guessed as candidate — and a tripped latch on a
+same-image channel at its current revision, which the old id-based
+counting may have produced from miscounted stable-bucket receipts, is
+cleared so that subsequent receipts re-evaluate it.
 
 ``channel_safety`` holds at most one risk circuit-breaker rule per
 channel, bound to the channel revision (``rule_revision``) at arming
@@ -61,6 +75,7 @@ import os
 import sqlite3
 import threading
 import uuid
+from datetime import datetime, timezone
 from typing import Optional
 
 #: Hard protocol limits (see README).
@@ -147,16 +162,25 @@ def init_db(path: Optional[str] = None) -> None:
             -- One row per (channel, device_id): the device's latest
             -- installation receipt.  `seq` strictly increases for a report
             -- to replace the stored one (monotonic across revisions);
-            -- `expected_id` is frozen at acceptance time.
+            -- `expected_id` is frozen at acceptance time, together with
+            -- `expected_role`: the bucket role the resolution produced
+            -- ('candidate' only for a genuine candidate-bucket pick with a
+            -- trusted candidate, 'stable' for the stable bucket and for
+            -- the untrusted-candidate / risk-breaker fallbacks).  The
+            -- canary risk breaker counts its sample by this frozen role,
+            -- never by comparing image ids, so same-image channels stay
+            -- correct.  NULL marks legacy rows whose role could not be
+            -- reliably backfilled (see the migration in init_db).
             CREATE TABLE IF NOT EXISTS receipts (
-                channel      TEXT    NOT NULL,
-                device_id    TEXT    NOT NULL,
-                seq          INTEGER NOT NULL,
-                revision     INTEGER NOT NULL,
-                status       TEXT    NOT NULL,
-                installed_id TEXT,
-                expected_id  TEXT    NOT NULL,
-                created_at   TEXT    NOT NULL,
+                channel       TEXT    NOT NULL,
+                device_id     TEXT    NOT NULL,
+                seq           INTEGER NOT NULL,
+                revision      INTEGER NOT NULL,
+                status        TEXT    NOT NULL,
+                installed_id  TEXT,
+                expected_id   TEXT    NOT NULL,
+                expected_role TEXT,
+                created_at    TEXT    NOT NULL,
                 PRIMARY KEY (channel, device_id),
                 FOREIGN KEY (channel) REFERENCES channels (name)
             ) WITHOUT ROWID;
@@ -232,6 +256,60 @@ def init_db(path: Optional[str] = None) -> None:
                 raise RuntimeError(
                     "images migration left dangling foreign-key rows"
                 )
+
+        # Upgrade a database created before receipts froze their bucket
+        # role: add the nullable expected_role column, backfill the rows
+        # whose role is reliably determinable, and clear the latches that
+        # the old id-based sample counting may have mis-latched on
+        # same-image channels.  Runs once, at startup, before the service
+        # accepts traffic; wrapped in one transaction.
+        cols = {
+            r["name"]
+            for r in conn.execute("PRAGMA table_info(receipts)")
+        }
+        if "expected_role" not in cols:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                conn.execute(
+                    "ALTER TABLE receipts ADD COLUMN expected_role TEXT"
+                )
+                # A role is reliable only for a receipt of the channel's
+                # CURRENT revision (the policy it was accepted under is the
+                # stored one) on a channel binding two DIFFERENT image ids:
+                # expected_id = candidate_id proves the candidate bucket,
+                # anything else the stable side.  Receipts on same-image
+                # channels and receipts of superseded revisions stay NULL —
+                # an ambiguous role is never guessed as candidate, so it
+                # can never inflate the canary sample.
+                conn.execute(
+                    "UPDATE receipts SET expected_role = ("
+                    "SELECT CASE "
+                    "WHEN c.candidate_id <> c.stable_id "
+                    " AND receipts.revision = c.revision THEN "
+                    "CASE WHEN receipts.expected_id = c.candidate_id "
+                    "THEN 'candidate' ELSE 'stable' END "
+                    "ELSE NULL END "
+                    "FROM channels c WHERE c.name = receipts.channel)"
+                )
+                # A latch on a channel whose stable and candidate images
+                # are the same id may have been produced by the old
+                # id-based counting mistaking stable-bucket receipts for
+                # candidate anomalies.  Clear such latches at the current
+                # revision (the armed rule itself is kept) so subsequent
+                # receipts re-evaluate the threshold under role-based
+                # counting and re-trip only if genuinely bad.
+                conn.execute(
+                    "UPDATE channel_safety SET tripped = 0, updated_at = ? "
+                    "WHERE tripped = 1 AND channel IN ("
+                    "SELECT name FROM channels "
+                    "WHERE stable_id = candidate_id "
+                    "AND revision = channel_safety.rule_revision)",
+                    (datetime.now(timezone.utc).isoformat(),),
+                )
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
 
         # Reaper's selection order: unsealed, due tasks ordered by
         # (last_activity_at, id).  Created after the migration above (a table

@@ -2461,3 +2461,386 @@ def test_safety_counts_only_current_revision_receipts(client, monkeypatch):
     post_receipt(client, "sf-rev", "d2", 1, "failed", revision=2)
     body = safety(client, "sf-rev")
     assert body["reports"] == 1 and body["anomalies"] == 1
+
+
+# --------------------------------------------------------------------------- #
+# Same-image channels: the breaker counts by frozen bucket role, not image id
+# --------------------------------------------------------------------------- #
+
+
+def make_same_image_channel(client, monkeypatch, name, percent):
+    """Channel whose stable and candidate roles point at ONE trusted image."""
+    sk1, pk1 = gen_key()
+    sk2, pk2 = gen_key()
+    set_keys(monkeypatch, {"ops": pk1, "ci": pk2})
+    signers = {"ops": sk1, "ci": sk2}
+    image = finalize_trusted(client, os.urandom(500), signers)
+    r = client.put(f"/channels/{name}", json={
+        "stable_id": image, "candidate_id": image,
+        "percent": percent, "expected_revision": 0,
+    })
+    assert r.status_code == 200, r.text
+    return image
+
+
+def _receipt_roles(name):
+    """{device_id: expected_role} of a channel, straight from SQLite."""
+    import sqlite3 as _sqlite3
+
+    from app.db import db_path
+
+    conn = _sqlite3.connect(db_path())
+    conn.row_factory = _sqlite3.Row
+    try:
+        rows = conn.execute(
+            "SELECT device_id, expected_role FROM receipts "
+            "WHERE channel = ? ORDER BY device_id",
+            (name,),
+        ).fetchall()
+        return {r["device_id"]: r["expected_role"] for r in rows}
+    finally:
+        conn.close()
+
+
+def test_safety_same_image_stable_bucket_failure_not_counted(client, monkeypatch):
+    """The reported mis-latch: stable_id == candidate_id, percent=0,
+    min_reports=1, max_bad_percent=0.  Every device lands in the stable
+    bucket; a failed receipt must NOT be counted as a candidate anomaly
+    and must not trip the breaker."""
+    image = make_same_image_channel(client, monkeypatch, "sf-same0", percent=0)
+    assert arm_safety(client, "sf-same0", 1, 1, 0).status_code == 200
+
+    r = post_receipt(client, "sf-same0", "d1", 1, "failed")
+    assert r.status_code == 200, r.text
+    assert r.json()["expected_id"] == image
+    assert r.json()["circuit_breaker_tripped"] is False
+    body = safety(client, "sf-same0")
+    assert body["reports"] == 0 and body["anomalies"] == 0
+    assert body["tripped"] is False and body["status"] == "monitoring"
+    assert _receipt_roles("sf-same0") == {"d1": "stable"}
+
+    # resolution is unaffected: percent=0 keeps serving the (same) image
+    res = client.get("/channels/sf-same0/resolve",
+                     params={"device_id": "d2"}).json()
+    assert res["image_id"] == image and res["reason"] == "stable"
+
+
+def test_safety_same_image_candidate_bucket_still_counts(client, monkeypatch):
+    """percent=100 with one shared image: every device is a candidate-bucket
+    device and DOES enter the sample even though the candidate image id
+    equals the stable one."""
+    image = make_same_image_channel(client, monkeypatch, "sf-same100",
+                                    percent=100)
+    assert arm_safety(client, "sf-same100", 1, 1, 0).status_code == 200
+
+    r = post_receipt(client, "sf-same100", "d1", 1, "success", image)
+    assert r.json()["expected_id"] == image
+    assert r.json()["matched"] is True
+    body = safety(client, "sf-same100")
+    assert body["reports"] == 1 and body["anomalies"] == 0
+    assert body["tripped"] is False
+
+    # a failed candidate-bucket install is an anomaly and trips immediately
+    r = post_receipt(client, "sf-same100", "d2", 1, "failed")
+    assert r.json()["circuit_breaker_tripped"] is True
+    body = safety(client, "sf-same100")
+    assert body["reports"] == 2 and body["anomalies"] == 1
+    assert body["tripped"] is True
+    roles = _receipt_roles("sf-same100")
+    assert roles == {"d1": "candidate", "d2": "candidate"}
+
+
+def test_safety_same_image_sample_follows_bucket_role(client, monkeypatch):
+    """percent=50 with one shared image: the sample follows the per-device
+    bucket, not the (identical) image id.  max_bad_percent=100 can never
+    trip, which isolates the counting itself."""
+    make_same_image_channel(client, monkeypatch, "sf-same50", percent=50)
+    assert arm_safety(client, "sf-same50", 1, 1, 100).status_code == 200
+
+    cand = stab = 0
+    for i in range(30):
+        dev = f"dev-{i}-角"
+        r = post_receipt(client, "sf-same50", dev, 1, "failed")
+        assert r.status_code == 200, r.text
+        if ref_channel_bucket("sf-same50", dev) < 50 * 100:
+            cand += 1
+        else:
+            stab += 1
+    assert cand > 0 and stab > 0  # both buckets exercised
+    body = safety(client, "sf-same50")
+    # every frozen expected_id is the same single image id, yet only the
+    # candidate-bucket failures are counted
+    assert body["reports"] == cand and body["anomalies"] == cand
+    assert body["tripped"] is False
+    roles = list(_receipt_roles("sf-same50").values())
+    assert roles.count("candidate") == cand
+    assert roles.count("stable") == stab
+
+
+def test_safety_same_image_overwrite_refreezes_role_latch_sticks(
+        client, monkeypatch):
+    """A larger-seq overwrite re-resolves and re-freezes the bucket role:
+    after the breaker latched, the overwrite freezes the risk-fallback
+    (stable) role and leaves the candidate sample — but the latch is
+    one-way and stays tripped."""
+    image = make_same_image_channel(client, monkeypatch, "sf-sameow",
+                                    percent=100)
+    assert arm_safety(client, "sf-sameow", 1, 1, 0).status_code == 200
+    r = post_receipt(client, "sf-sameow", "d1", 1, "failed")
+    assert r.json()["circuit_breaker_tripped"] is True
+    assert safety(client, "sf-sameow")["reports"] == 1
+
+    # larger seq: re-resolved under the latched breaker -> risk fallback,
+    # role stable; the receipt leaves the candidate sample...
+    r = post_receipt(client, "sf-sameow", "d1", 2, "success", image)
+    assert r.status_code == 200 and r.json()["stored"] == "replaced"
+    assert r.json()["expected_id"] == image  # same id, stable-role freeze
+    assert r.json()["circuit_breaker_tripped"] is True
+    body = safety(client, "sf-sameow")
+    assert body["reports"] == 0 and body["anomalies"] == 0
+    assert body["tripped"] is True  # ...but the latch never clears
+    assert _receipt_roles("sf-sameow") == {"d1": "stable"}
+
+    # idempotent replay of the stored receipt keeps the frozen role as-is
+    r = post_receipt(client, "sf-sameow", "d1", 2, "success", image)
+    assert r.json()["stored"] == "unchanged"
+    assert _receipt_roles("sf-sameow") == {"d1": "stable"}
+
+
+def test_old_database_migrates_receipt_roles_and_clears_same_image_latch(
+        tmp_path, monkeypatch):
+    """A DB written before receipts froze their bucket role is upgraded at
+    startup: the column appears, reliably-known roles are backfilled,
+    ambiguous same-image / old-revision rows stay unknown (never guessed
+    as candidate), and a same-image channel's possibly mis-counted latch
+    is cleared so subsequent receipts re-evaluate it — while a distinct-id
+    channel's correctly computed latch is preserved."""
+    import sqlite3 as _sqlite3
+
+    from app.db import init_db
+    from app.main import app as app_module
+
+    old_db = tmp_path / "old.db"
+    created = "2026-01-02T03:04:05.000000+00:00"
+
+    sk1, pk1 = gen_key()
+    sk2, pk2 = gen_key()
+    monkeypatch.setenv("TRUSTED_KEYS_JSON",
+                       json.dumps({"ops": pk1, "ci": pk2}))
+
+    def image_row(tid: str, payload: bytes):
+        return (tid, len(payload), hashlib.sha256(payload).hexdigest(),
+                1, created, created)
+
+    conn = _sqlite3.connect(old_db)
+    try:
+        # The pre-role schema: receipts has no expected_role column.
+        conn.executescript(
+            """
+            CREATE TABLE images (
+                id          TEXT PRIMARY KEY,
+                total_size  INTEGER NOT NULL,
+                sha256      TEXT    NOT NULL,
+                finalized   INTEGER NOT NULL DEFAULT 0,
+                created_at  TEXT    NOT NULL,
+                last_activity_at TEXT NOT NULL
+            );
+            CREATE TABLE chunks (
+                image_id   TEXT    NOT NULL,
+                "offset"   INTEGER NOT NULL,
+                end_offset INTEGER NOT NULL,
+                data       BLOB    NOT NULL,
+                PRIMARY KEY (image_id, "offset"),
+                FOREIGN KEY (image_id) REFERENCES images (id)
+            ) WITHOUT ROWID;
+            CREATE TABLE attestations (
+                image_id   TEXT NOT NULL,
+                key_id     TEXT NOT NULL,
+                signature  TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (image_id, key_id),
+                FOREIGN KEY (image_id) REFERENCES images (id)
+            ) WITHOUT ROWID;
+            CREATE TABLE channels (
+                name         TEXT PRIMARY KEY,
+                stable_id    TEXT NOT NULL,
+                candidate_id TEXT NOT NULL,
+                percent      INTEGER NOT NULL,
+                revision     INTEGER NOT NULL,
+                updated_at   TEXT NOT NULL,
+                FOREIGN KEY (stable_id) REFERENCES images (id),
+                FOREIGN KEY (candidate_id) REFERENCES images (id)
+            ) WITHOUT ROWID;
+            CREATE TABLE receipts (
+                channel      TEXT    NOT NULL,
+                device_id    TEXT    NOT NULL,
+                seq          INTEGER NOT NULL,
+                revision     INTEGER NOT NULL,
+                status       TEXT    NOT NULL,
+                installed_id TEXT,
+                expected_id  TEXT    NOT NULL,
+                created_at   TEXT    NOT NULL,
+                PRIMARY KEY (channel, device_id),
+                FOREIGN KEY (channel) REFERENCES channels (name)
+            ) WITHOUT ROWID;
+            CREATE TABLE channel_safety (
+                channel         TEXT PRIMARY KEY,
+                rule_revision   INTEGER NOT NULL,
+                min_reports     INTEGER NOT NULL,
+                max_bad_percent INTEGER NOT NULL,
+                tripped         INTEGER NOT NULL DEFAULT 0,
+                created_at      TEXT    NOT NULL,
+                updated_at      TEXT    NOT NULL,
+                FOREIGN KEY (channel) REFERENCES channels (name)
+            ) WITHOUT ROWID;
+            """
+        )
+        conn.executemany(
+            "INSERT INTO images (id, total_size, sha256, finalized, "
+            "created_at, last_activity_at) VALUES (?, ?, ?, ?, ?, ?)",
+            [
+                image_row("img-shared", b"shared-image-bytes"),
+                image_row("img-a", b"distinct-stable-bytes"),
+                image_row("img-b", b"distinct-candidate-bytes"),
+            ],
+        )
+        # both images of the distinct channel and the shared image are
+        # attested by both keys, so receipts resolve as trusted
+        for tid in ("img-shared", "img-a", "img-b"):
+            row = conn.execute(
+                "SELECT id, sha256, total_size FROM images WHERE id = ?",
+                (tid,),
+            ).fetchone()
+            for key_id, sk in (("ops", sk1), ("ci", sk2)):
+                conn.execute(
+                    "INSERT INTO attestations "
+                    "(image_id, key_id, signature, created_at) "
+                    "VALUES (?, ?, ?, ?)",
+                    (tid, key_id,
+                     sign(sk, row[0], row[1], row[2]), created),
+                )
+        conn.executemany(
+            "INSERT INTO channels "
+            "(name, stable_id, candidate_id, percent, revision, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            [
+                # stable and candidate are the SAME image id
+                ("gray-same", "img-shared", "img-shared", 0, 1, created),
+                ("gray-retrip", "img-shared", "img-shared", 100, 1, created),
+                # distinct images; revision 2 leaves room for an old-revision
+                # receipt below
+                ("gray-dist", "img-a", "img-b", 100, 2, created),
+            ],
+        )
+        conn.executemany(
+            "INSERT INTO receipts "
+            "(channel, device_id, seq, revision, status, installed_id, "
+            " expected_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            [
+                # same-image channel: role is ambiguous -> must stay unknown
+                ("gray-same", "d-old", 1, 1, "failed", None,
+                 "img-shared", created),
+                # distinct ids, current revision -> reliably determinable
+                ("gray-dist", "d-cand", 1, 2, "failed", None,
+                 "img-b", created),
+                ("gray-dist", "d-stab", 1, 2, "success", "img-a",
+                 "img-a", created),
+                # superseded revision: old policy unknown -> must stay unknown
+                ("gray-dist", "d-prev", 1, 1, "failed", None,
+                 "img-b", created),
+            ],
+        )
+        conn.executemany(
+            "INSERT INTO channel_safety "
+            "(channel, rule_revision, min_reports, max_bad_percent, tripped, "
+            " created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            [
+                # latches the old id-based counting may have mis-produced
+                ("gray-same", 1, 1, 0, 1, created, created),
+                ("gray-retrip", 1, 1, 0, 1, created, created),
+                # distinct ids: the old counting was correct -> keep
+                ("gray-dist", 2, 1, 0, 1, created, created),
+            ],
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    init_db(str(old_db))
+
+    conn = _sqlite3.connect(old_db)
+    conn.row_factory = _sqlite3.Row
+    try:
+        cols = {r["name"] for r in conn.execute("PRAGMA table_info(receipts)")}
+        assert "expected_role" in cols
+        roles = {
+            (r["channel"], r["device_id"]): r["expected_role"]
+            for r in conn.execute(
+                "SELECT channel, device_id, expected_role FROM receipts"
+            )
+        }
+        assert roles[("gray-same", "d-old")] is None      # ambiguous: no guess
+        assert roles[("gray-dist", "d-cand")] == "candidate"
+        assert roles[("gray-dist", "d-stab")] == "stable"
+        assert roles[("gray-dist", "d-prev")] is None     # old revision
+        latches = {
+            r["channel"]: r["tripped"]
+            for r in conn.execute(
+                "SELECT channel, tripped FROM channel_safety"
+            )
+        }
+        assert latches["gray-same"] == 0    # possibly mis-latched: cleared
+        assert latches["gray-retrip"] == 0  # possibly mis-latched: cleared
+        assert latches["gray-dist"] == 1    # correctly computed: preserved
+    finally:
+        conn.close()
+
+    # The service works against the migrated file through a TestClient.
+    monkeypatch.setenv("IMAGE_DB_PATH", str(old_db))
+    with TestClient(app_module) as c:
+        # gray-same: rule kept, latch cleared, ambiguous row not counted
+        body = c.get("/channels/gray-same/safety").json()
+        assert body["min_reports"] == 1 and body["max_bad_percent"] == 0
+        assert body["reports"] == 0 and body["anomalies"] == 0
+        assert body["tripped"] is False and body["status"] == "monitoring"
+        # resolution no longer rolls back
+        res = c.get("/channels/gray-same/resolve",
+                    params={"device_id": "whoever"}).json()
+        assert res["image_id"] == "img-shared" and res["reason"] == "stable"
+
+        # idempotent replay of the legacy row keeps its unknown role and
+        # does not re-evaluate anything
+        r = c.post("/channels/gray-same/receipts", json={
+            "device_id": "d-old", "revision": 1, "seq": 1, "status": "failed",
+        })
+        assert r.status_code == 200 and r.json()["stored"] == "unchanged"
+        assert r.json()["expected_id"] == "img-shared"
+        assert r.json()["circuit_breaker_tripped"] is False
+
+        # a NEW failed receipt on the percent=0 same-image channel freezes
+        # the stable role, stays out of the sample and does NOT re-latch
+        r = c.post("/channels/gray-same/receipts", json={
+            "device_id": "d-new", "revision": 1, "seq": 1, "status": "failed",
+        })
+        assert r.status_code == 200, r.text
+        assert r.json()["expected_id"] == "img-shared"
+        assert r.json()["circuit_breaker_tripped"] is False
+        body = c.get("/channels/gray-same/safety").json()
+        assert body["reports"] == 0 and body["anomalies"] == 0
+        assert body["tripped"] is False
+
+        # gray-retrip (same image, percent=100): the cleared latch is
+        # re-evaluated on the next receipt and genuinely re-trips
+        r = c.post("/channels/gray-retrip/receipts", json={
+            "device_id": "d-bad", "revision": 1, "seq": 1, "status": "failed",
+        })
+        assert r.status_code == 200
+        assert r.json()["circuit_breaker_tripped"] is True
+        body = c.get("/channels/gray-retrip/safety").json()
+        assert body["reports"] == 1 and body["anomalies"] == 1
+        assert body["tripped"] is True
+
+        # gray-dist: latch preserved; backfilled roles drive the counts
+        body = c.get("/channels/gray-dist/safety").json()
+        assert body["reports"] == 1 and body["anomalies"] == 1
+        assert body["tripped"] is True and body["status"] == "tripped"
