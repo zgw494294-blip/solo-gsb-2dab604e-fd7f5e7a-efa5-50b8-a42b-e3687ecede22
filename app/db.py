@@ -42,7 +42,16 @@ accepted); ``expected_id`` is the image the device should have installed,
 computed by the channel's resolution rules inside the same write
 transaction that stored the receipt and never rewritten afterwards —
 later policy or public-key changes do not alter it, and the
-installation-audit endpoint reads it back as saved.
+installation-audit endpoint reads it back as saved.  ``bucket_role`` is
+the resolution role frozen at that same instant (``candidate`` for a
+trusted-candidate canary bucket, ``stable`` for a stable bucket,
+``candidate_untrusted_fallback`` / ``risk_circuit_breaker_fallback`` for
+the two rollback paths): the risk breaker classifies canary samples by
+this role, never by image id, so stable and candidate slots bound to the
+SAME image id cannot be confused.  The column is nullable on purpose:
+rows written before this column existed whose role cannot be recovered
+reliably (see the migration in ``init_db``) stay NULL and are never
+guessed as canary samples.
 
 ``channel_safety`` holds at most one risk circuit-breaker rule per
 channel, bound to the channel revision (``rule_revision``) at arming
@@ -61,6 +70,7 @@ import os
 import sqlite3
 import threading
 import uuid
+from datetime import datetime, timezone
 from typing import Optional
 
 #: Hard protocol limits (see README).
@@ -147,7 +157,8 @@ def init_db(path: Optional[str] = None) -> None:
             -- One row per (channel, device_id): the device's latest
             -- installation receipt.  `seq` strictly increases for a report
             -- to replace the stored one (monotonic across revisions);
-            -- `expected_id` is frozen at acceptance time.
+            -- `expected_id` and `bucket_role` are frozen at acceptance time
+            -- (role NULL only for legacy rows migrated from an older schema).
             CREATE TABLE IF NOT EXISTS receipts (
                 channel      TEXT    NOT NULL,
                 device_id    TEXT    NOT NULL,
@@ -156,6 +167,7 @@ def init_db(path: Optional[str] = None) -> None:
                 status       TEXT    NOT NULL,
                 installed_id TEXT,
                 expected_id  TEXT    NOT NULL,
+                bucket_role  TEXT,
                 created_at   TEXT    NOT NULL,
                 PRIMARY KEY (channel, device_id),
                 FOREIGN KEY (channel) REFERENCES channels (name)
@@ -232,6 +244,80 @@ def init_db(path: Optional[str] = None) -> None:
                 raise RuntimeError(
                     "images migration left dangling foreign-key rows"
                 )
+
+        # Upgrade a database written before receipts froze their bucket role:
+        # add the role column and make the breaker count by role instead of by
+        # image id (the two slots may legitimately bind the same image id).
+        has_receipts = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'receipts'"
+        ).fetchone() is not None
+        receipt_cols = {
+            r["name"] for r in conn.execute("PRAGMA table_info(receipts)")
+        } if has_receipts else set()
+        if "bucket_role" not in receipt_cols:
+            # ALTER TABLE ADD COLUMN on a WITHOUT ROWID table leaves existing
+            # rows with NULL.  Runs once, at startup, before traffic: one
+            # BEGIN IMMEDIATE transaction performs the column add, the
+            # best-effort role backfill and the ambiguous-latch clearing
+            # together, so an interrupted upgrade leaves the old schema in
+            # place and is retried on the next start.
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                conn.execute("ALTER TABLE receipts ADD COLUMN bucket_role TEXT")
+
+                # Backfill only roles that are recoverable with certainty:
+                # a current-revision receipt of a channel whose two slots
+                # hold DIFFERENT image ids, frozen to the candidate id, is
+                # unambiguously a canary receipt.  Everything else — notably
+                # every receipt of a same-image channel, and every
+                # old-revision receipt whose policy is no longer stored —
+                # stays NULL and is never guessed as a candidate.
+                conn.execute(
+                    "UPDATE receipts SET bucket_role = 'candidate' "
+                    "WHERE bucket_role IS NULL "
+                    "AND revision = ("
+                    "    SELECT c.revision FROM channels c "
+                    "    WHERE c.name = receipts.channel"
+                    ") "
+                    "AND expected_id = ("
+                    "    SELECT c.candidate_id FROM channels c "
+                    "    WHERE c.name = receipts.channel"
+                    ") "
+                    "AND EXISTS ("
+                    "    SELECT 1 FROM channels c "
+                    "    WHERE c.name = receipts.channel "
+                    "    AND c.stable_id <> c.candidate_id"
+                    ")"
+                )
+
+                # Old code classified canary receipts by image id, so a
+                # latched rule at a same-image revision could have been
+                # flipped by stable-bucket/rollback receipts (its sample was
+                # ambiguous).  Clear that revision's latch — keeping the
+                # armed rule — so subsequent receipts re-evaluate under the
+                # role-based rule; distinct-image channels keep their
+                # (reliably-derived) latches.
+                conn.execute(
+                    "UPDATE channel_safety SET tripped = 0, updated_at = ? "
+                    "WHERE tripped = 1 AND rule_revision = ("
+                    "    SELECT c.revision FROM channels c "
+                    "    WHERE c.name = channel_safety.channel"
+                    ") AND EXISTS ("
+                    "    SELECT 1 FROM channels c "
+                    "    WHERE c.name = channel_safety.channel "
+                    "    AND c.stable_id = c.candidate_id"
+                    ") AND EXISTS ("
+                    "    SELECT 1 FROM receipts r "
+                    "    WHERE r.channel = channel_safety.channel "
+                    "    AND r.revision = rule_revision "
+                    "    AND r.bucket_role IS NULL"
+                    ")",
+                    (datetime.now(timezone.utc).isoformat(),),
+                )
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
 
         # Reaper's selection order: unsealed, due tasks ordered by
         # (last_activity_at, id).  Created after the migration above (a table

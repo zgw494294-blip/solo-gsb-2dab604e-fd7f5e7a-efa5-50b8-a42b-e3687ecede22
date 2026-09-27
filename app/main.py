@@ -30,8 +30,9 @@ GET    /channels/{name}/resolve?device_id=...
                                        trusted stable image
 POST   /channels/{name}/receipts       accept a device installation receipt
                                        for the channel's current revision;
-                                       the expected image is resolved and
-                                       frozen in the same write transaction
+                                       the expected image and the bucket
+                                       role are resolved and frozen in the
+                                       same write transaction
 GET    /channels/{name}/installation-audit
                                        per-device counts (success matched /
                                        success deviated / failed) over the
@@ -1195,6 +1196,14 @@ def get_trust(task_id: str) -> dict:
 #: candidate) and percent=100 (always candidate, trust permitting).
 CHANNEL_BUCKET_COUNT = 10000
 
+#: Resolution role of a receipt frozen to the candidate canary bucket while
+#: the candidate image is trusted.  The risk circuit breaker's canary sample
+#: is classified by the receipt's frozen bucket_role — never by image id —
+#: so this exact string is the only role that enters the sample.  Stable
+#: buckets and both fallback paths are excluded even when their image id
+#: equals the candidate's.
+BUCKET_ROLE_CANDIDATE = "candidate"
+
 
 def _channel_row(conn: sqlite3.Connection, name: str) -> sqlite3.Row | None:
     return conn.execute(
@@ -1218,21 +1227,31 @@ def _safety_candidate_counts(
 ) -> tuple[int, int]:
     """(sample, anomalies) over the *candidate* canary of the current revision.
 
-    The sample is the current-revision receipts whose frozen ``expected_id``
-    is the channel's candidate image — i.e. devices that were *supposed* to
-    install the candidate at acceptance time (a receipt frozen to the stable
-    image via an untrusted-candidate fallback never enters the canary
-    sample).  An anomaly is a failed install, or a reported success whose
+    Membership is decided by the receipt's frozen ``bucket_role`` — the
+    resolution role (``candidate`` / ``stable`` /
+    ``candidate_untrusted_fallback`` / ``risk_circuit_breaker_fallback``)
+    frozen at acceptance time — and NEVER by the image id.  A receipt is
+    in the canary sample exactly when its frozen role says its bucket was
+    the canary bucket and the candidate was trusted, i.e.
+    ``bucket_role = 'candidate'``.  Stable-bucket receipts and both
+    fallback paths stay out even when they point at the very same image id
+    the candidate slot binds (``percent=0`` channels legitimately bind
+    both slots to one image), which previously let one stable-bucket
+    failure latch a zero-tolerance breaker.  The same-image canary bucket
+    — candidate bucket whose frozen image happens to equal the stable
+    image id — still counts, by role.  Legacy rows with no recoverable
+    role (NULL, see init_db) are never guessed as candidate samples.  An
+    anomaly is a failed install, or a reported success whose
     ``installed_id`` differs from the frozen ``expected_id``.  Each device
     counts once through its single latest receipt.  One statement, one
-    snapshot — used both by the safety endpoint and by the in-transaction
-    latch evaluation after a new receipt lands.
+    snapshot — used both by the safety endpoint and by the
+    in-transaction latch evaluation after a new receipt lands.
     """
     row = conn.execute(
         "SELECT "
-        "COALESCE(SUM(CASE WHEN r.expected_id = c.candidate_id "
+        "COALESCE(SUM(CASE WHEN r.bucket_role = ? "
         "             THEN 1 ELSE 0 END), 0) AS sample_n, "
-        "COALESCE(SUM(CASE WHEN r.expected_id = c.candidate_id AND "
+        "COALESCE(SUM(CASE WHEN r.bucket_role = ? AND "
         "    (r.status = 'failed' OR "
         "     (r.status = 'success' AND r.installed_id <> r.expected_id)) "
         "             THEN 1 ELSE 0 END), 0) AS bad_n "
@@ -1240,7 +1259,7 @@ def _safety_candidate_counts(
         "  ON r.channel = c.name AND r.revision = c.revision "
         "WHERE c.name = ? "
         "GROUP BY c.name, c.revision",
-        (channel["name"],),
+        (BUCKET_ROLE_CANDIDATE, BUCKET_ROLE_CANDIDATE, channel["name"]),
     ).fetchone()
     if row is None:  # channel vanished mid-transaction (defensive)
         return 0, 0
@@ -1314,7 +1333,9 @@ def _resolve_for_device(
     untrusted stable image aborts the resolution with 409 — a device is
     never directed at an untrusted image.  Used both by the read-only
     resolve endpoint and by the receipt endpoint, which freezes the
-    returned image id as the receipt's ``expected_id``.
+    returned image id as the receipt's ``expected_id`` and the returned
+    reason as the receipt's ``bucket_role`` (the breaker's canary sample
+    is later classified by that frozen role).
 
     When ``breaker_tripped`` is set (the channel's armed safety rule has
     latched at this revision), every bucket that would have selected the
@@ -1605,10 +1626,13 @@ def get_channel_safety(
     """Return the armed rule, current sample/anomaly counts and latch state.
 
     ``reports`` is the number of devices whose current-revision receipt
-    froze the candidate image as the expected one (the canary sample);
-    ``anomalies`` counts the failed installs and successful-but-deviated
-    installs among them.  ``status`` is ``monitoring`` until, once the
-    sample reaches ``min_reports`` and ``anomalies * 100`` strictly exceeds
+    froze the canary bucket role (trusted-candidate selection) as its
+    ``bucket_role`` — the canary sample, classified by role rather than
+    image id, so stable and candidate slots binding the same image id do
+    not mix; ``anomalies`` counts the failed installs and
+    successful-but-deviated installs among them.  ``status`` is
+    ``monitoring`` until, once the sample reaches ``min_reports`` and
+    ``anomalies * 100`` strictly exceeds
     ``reports * max_bad_percent``, the breaker latches to ``tripped`` —
     sticky for the rest of the revision.  404 if the channel does not
     exist or the current revision has no armed rule (an earlier revision's
@@ -1650,8 +1674,12 @@ def post_receipt(
     installed is computed by the channel's normal resolution rules —
     per-device bucket, live trust re-verification, candidate-untrusted
     fallback — inside the same BEGIN IMMEDIATE write transaction that
-    persists the receipt, and is frozen as ``expected_id``; an untrusted
-    stable image rejects the receipt with 409 and nothing is stored.
+    persists the receipt, and is frozen as ``expected_id`` together with
+    the resolution role (``bucket_role``); an untrusted stable image
+    rejects the receipt with 409 and nothing is stored.  The frozen role,
+    not the image id, classifies the risk breaker's canary sample, so a
+    channel whose stable and candidate slots bind the SAME image id still
+    separates stable buckets from canary buckets.
 
     Each (channel, device) pair keeps only the receipt with the largest
     ``seq``; ``seq`` is monotonic across channel revisions.  A smaller
@@ -1735,11 +1763,15 @@ def post_receipt(
                     expected_id = existing["expected_id"]
                 else:
                     # New device or a larger seq: resolve the expected image
-                    # now, inside this write transaction, and freeze it.  A
-                    # latched circuit breaker redirects candidate buckets to
-                    # the stable image at this point, so new receipts after
-                    # tripping freeze the rollback image.
-                    expected_id, _, _ = _resolve_for_device(
+                    # now, inside this write transaction, and freeze BOTH the
+                    # image id and the bucket role.  A latched circuit breaker
+                    # redirects candidate buckets to the stable image at this
+                    # point, so new receipts after tripping freeze the
+                    # rollback image with the risk-fallback role.  The role is
+                    # what later classifies the canary sample, so even with
+                    # stable and candidate bound to the same image id a stable
+                    # bucket can never be mistaken for a canary receipt.
+                    expected_id, expected_role, _ = _resolve_for_device(
                         conn,
                         channel,
                         req.device_id,
@@ -1748,14 +1780,15 @@ def post_receipt(
                     conn.execute(
                         "INSERT INTO receipts "
                         "(channel, device_id, seq, revision, status, "
-                        " installed_id, expected_id, created_at) "
-                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
+                        " installed_id, expected_id, bucket_role, created_at) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) "
                         "ON CONFLICT (channel, device_id) DO UPDATE SET "
                         "seq = excluded.seq, "
                         "revision = excluded.revision, "
                         "status = excluded.status, "
                         "installed_id = excluded.installed_id, "
                         "expected_id = excluded.expected_id, "
+                        "bucket_role = excluded.bucket_role, "
                         "created_at = excluded.created_at",
                         (
                             name,
@@ -1765,6 +1798,7 @@ def post_receipt(
                             req.status,
                             req.installed_id,
                             expected_id,
+                            expected_role,
                             datetime.now(timezone.utc).isoformat(),
                         ),
                     )
@@ -1772,11 +1806,11 @@ def post_receipt(
 
                     # Evaluate the risk breaker in the SAME write transaction
                     # in which the receipt lands.  Only receipts whose frozen
-                    # expected image is the candidate form the canary sample;
-                    # a failed install or a success whose installed image
-                    # differs from the frozen one is an anomaly.  The latch
-                    # is one-way: once set it is never cleared, regardless of
-                    # how later overwrites move the percentages.
+                    # bucket role is the canary role form the sample; a failed
+                    # install or a success whose installed image differs from
+                    # the frozen one is an anomaly.  The latch is one-way: once
+                    # set it is never cleared, regardless of how later
+                    # overwrites move the percentages.
                     if safety is not None and not tripped_before:
                         sample_n, bad_n = _safety_candidate_counts(
                             conn, channel
