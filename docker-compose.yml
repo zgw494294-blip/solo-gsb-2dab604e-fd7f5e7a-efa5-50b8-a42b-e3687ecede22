@@ -1,0 +1,27 @@
+services:
+  firmware-api:
+    build: .
+    image: firmware-image-api:latest
+    container_name: firmware-image-api
+    ports:
+      # host port 8000 -> container port 8000
+      - "8000:8000"
+    environment:
+      # Optional trust configuration: JSON object mapping key_id -> base64
+      # Ed25519 public key. Passed straight through from the shell, e.g.
+      #   TRUSTED_KEYS_JSON='{"ops":"...","ci":"..."}' docker compose up -d --build
+      # Unset/empty simply means "no trusted keys configured" (all untrusted).
+      - TRUSTED_KEYS_JSON=${TRUSTED_KEYS_JSON:-}
+    volumes:
+      # Named volume holds images.db (+ WAL/SHM). Tasks and chunks survive
+      # `docker compose down` and full image/container rebuilds.
+      - firmware-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+volumes:
+  firmware-data:
